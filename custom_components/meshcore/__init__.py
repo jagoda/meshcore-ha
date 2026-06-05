@@ -776,6 +776,21 @@ async def async_remove_config_entry_device(
     Refuses removal of the main hub device and of repeater/client devices
     that are still present in the config entry. Allows removal of orphans
     (devices whose pubkey_prefix is no longer in the configured lists).
+
+    For contact/unknown node types the coordinator must be present AND have
+    completed at least one successful refresh before a removal is allowed.
+    An absent coordinator (entry mid-reload) or a coordinator whose last
+    update did not succeed (reconnect / failed refresh) means we cannot trust
+    the live-contacts snapshot.  In that window we refuse removal rather than
+    risk purging the entity registration of a node that is still alive.
+
+    Design note — coordinator-None contract:
+        When coordinator is None the entry is in a transient state (startup or
+        reload).  This is indistinguishable from a short-lived race where the
+        radio is momentarily unreachable.  We choose the conservative path:
+        refuse contact/unknown removal.  The user can retry once the
+        integration has settled.  Repeater and client devices are still
+        governed solely by the config-entry data and are unaffected.
     """
     entry_id = config_entry.entry_id
     repeater_prefixes = {
@@ -789,11 +804,21 @@ async def async_remove_config_entry_device(
         if c.get("pubkey_prefix")
     }
 
-    # Build the set of live contact prefixes from the coordinator. Config
+    # Build the set of live contact prefixes from the coordinator.  Config
     # prefixes are always 12 chars; normalize contact prefixes the same way.
+    #
+    # Trustworthiness requires all three of:
+    #   1. coordinator is present in hass.data
+    #   2. coordinator.data is truthy (at least one successful poll has run)
+    #   3. coordinator.last_update_success is True (last poll did not fail)
     coordinator = hass.data.get(DOMAIN, {}).get(entry_id)
-    live_contact_prefixes = set()
-    if coordinator is not None and getattr(coordinator, "data", None):
+    live_contact_prefixes: set = set()
+    coordinator_trustworthy = bool(
+        coordinator is not None
+        and getattr(coordinator, "data", None)
+        and getattr(coordinator, "last_update_success", False)
+    )
+    if coordinator_trustworthy:
         for contact in coordinator.data.get("contacts", []):
             prefix = contact.get("pubkey_prefix") or (contact.get("public_key") or "")[:12]
             if prefix:
@@ -803,6 +828,7 @@ async def async_remove_config_entry_device(
         if domain != DOMAIN:
             continue
 
+        # The hub device shares its identifier with the config-entry id.
         if identifier == entry_id:
             return False
 
@@ -812,7 +838,7 @@ async def async_remove_config_entry_device(
         remainder = identifier[len(prefix):]
         node_type, _, pubkey_prefix = remainder.partition("_")
         # Device identifiers may carry the full 64-char public_key (contact
-        # fallback in _get_node_info). Config prefixes are always 12 chars,
+        # fallback in _get_node_info).  Config prefixes are always 12 chars,
         # so normalize before comparing.
         pubkey_prefix = pubkey_prefix[:12]
 
@@ -820,7 +846,13 @@ async def async_remove_config_entry_device(
             return False
         if node_type == "client" and pubkey_prefix in client_prefixes:
             return False
-        if node_type in ("contact", "unknown") and pubkey_prefix in live_contact_prefixes:
-            return False
+        if node_type in ("contact", "unknown"):
+            if not coordinator_trustworthy:
+                # Coordinator absent or last refresh did not succeed — refuse
+                # removal to avoid accidentally deleting a live node's
+                # entity registration.
+                return False
+            if pubkey_prefix in live_contact_prefixes:
+                return False
 
     return True
